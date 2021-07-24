@@ -1,9 +1,10 @@
+use std::env::VarError;
 use std::fs;
 use std::io::Write;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use lazy_static::lazy_static;
 use native_tls::TlsConnector;
@@ -22,7 +23,7 @@ struct Pg {
     stat: Statement,
 }
 
-fn connect() -> Result<Pg> {
+fn connect(config: &Config) -> Result<Pg> {
     let connector = TlsConnector::builder()
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
@@ -30,9 +31,8 @@ fn connect() -> Result<Pg> {
         .with_context(|| anyhow!("configuring tls connection"))?;
     let connector = MakeTlsConnector::new(connector);
 
-    let mut client =
-        postgres::Client::connect("host=localhost user=postgres sslmode=require", connector)
-            .with_context(|| anyhow!("connecting to database"))?;
+    let mut client = postgres::Client::connect(&config.conn_string, connector)
+        .with_context(|| anyhow!("connecting to database"))?;
 
     // millis
     client
@@ -131,8 +131,53 @@ fn expect_ctrl_c() -> Result<Receiver<()>> {
     Ok(shutdown_requested)
 }
 
+struct Config {
+    poll_interval: Duration,
+    max_uptime: Duration,
+    conn_string: String,
+}
+
+fn secs_to_duration(secs: &str) -> Result<Duration> {
+    let secs = secs
+        .parse()
+        .with_context(|| anyhow!("parsing {:?} as float", secs))?;
+
+    if secs < 1. / 1e9 || secs > ((1u64 << 32) as f64) {
+        bail!("seconds values must roughly be between 1ns and 100 years");
+    }
+
+    Ok(Duration::from_secs_f64(secs))
+}
+
+fn env_var(name: &'static str) -> Result<Option<String>> {
+    Ok(match std::env::var(name) {
+        Ok(v) => Some(v),
+        Err(VarError::NotUnicode(_)) => bail!("{}: invalid unicode", name),
+        Err(VarError::NotPresent) => None,
+    })
+}
+
+fn duration_from_env(name: &'static str, default: Duration) -> Result<Duration> {
+    Ok(match env_var(name)? {
+        Some(v) => secs_to_duration(&v).with_context(|| anyhow!("interpreting {}", name))?,
+        None => default,
+    })
+}
+
+fn config() -> Result<Config> {
+    Ok(Config {
+        poll_interval: duration_from_env("PSD_POLL_INTERVAL_SECS", Duration::from_secs(53))?,
+        max_uptime: duration_from_env("PSD_MAX_UPTIME_SECS", Duration::from_secs(60 * 60))?,
+        conn_string: env_var("PSD_CONN_STRING")?.ok_or_else(|| {
+            anyhow!("PSD_CONN_STRING required, e.g.: host=localhost user=postgres sslmode=require")
+        })?,
+    })
+}
+
 fn main() -> Result<()> {
-    let mut conn = connect()?;
+    let cfg = config()?;
+
+    let mut conn = connect(&cfg)?;
 
     let started_time = Instant::now();
     let mut output = open()?;
@@ -147,7 +192,7 @@ fn main() -> Result<()> {
             Err(e) => {
                 eprintln!("{:?} retrying error: {:?}", Utc::now(), e);
                 attempt_close(conn);
-                conn = connect().with_context(|| anyhow!("reconnecting after fetch error"))?;
+                conn = connect(&cfg).with_context(|| anyhow!("reconnecting after fetch error"))?;
                 fetch(&mut conn).with_context(|| anyhow!("fetch after reconnection"))?
             }
         };
@@ -161,11 +206,11 @@ fn main() -> Result<()> {
             .flush()
             .with_context(|| anyhow!("flushing compressed data"))?;
 
-        if started_time.elapsed().gt(&Duration::from_secs(60 * 60)) {
+        if started_time.elapsed().gt(&cfg.max_uptime) {
             break;
         }
 
-        match shutdown_requested.recv_timeout(Duration::from_secs(57)) {
+        match shutdown_requested.recv_timeout(cfg.poll_interval) {
             Err(RecvTimeoutError::Timeout) => (),
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
         }
