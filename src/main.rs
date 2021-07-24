@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -118,6 +119,18 @@ fn attempt_close(conn: Pg) {
     }
 }
 
+fn expect_ctrl_c() -> Result<Receiver<()>> {
+    let (initiate_shutdown, shutdown_requested) = std::sync::mpsc::sync_channel(1);
+    ctrlc::set_handler(move || match initiate_shutdown.try_send(()) {
+        Ok(()) => eprintln!("{:?} started clean shutdown", Utc::now()),
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            eprintln!("{:?} second exit request; dying", Utc::now());
+            std::process::exit(6)
+        }
+    })?;
+    Ok(shutdown_requested)
+}
+
 fn main() -> Result<()> {
     let mut conn = connect()?;
 
@@ -125,6 +138,8 @@ fn main() -> Result<()> {
     let mut output = open()?;
 
     let mut mins: Box<[usize]> = vec![0usize; conn.stat.columns().len()].into_boxed_slice();
+
+    let shutdown_requested = expect_ctrl_c()?;
 
     loop {
         let lines = match fetch(&mut conn) {
@@ -149,7 +164,11 @@ fn main() -> Result<()> {
         if started_time.elapsed().gt(&Duration::from_secs(60 * 60)) {
             break;
         }
-        std::thread::sleep(Duration::from_secs(57));
+
+        match shutdown_requested.recv_timeout(Duration::from_secs(57)) {
+            Err(RecvTimeoutError::Timeout) => (),
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
 
     attempt_close(conn);
@@ -157,6 +176,8 @@ fn main() -> Result<()> {
     output
         .do_finish()
         .with_context(|| anyhow!("finalising output file during clean exit"))?;
+
+    eprintln!("{:?} clean exit", Utc::now());
 
     Ok(())
 }
