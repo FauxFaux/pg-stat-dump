@@ -42,7 +42,7 @@ fn connect(config: &Config) -> Result<Pg> {
     let stat = client.prepare(
         concat!(
             "select now(), datid, datname, pid, usesysid, usename, application_name, client_addr::varchar, client_hostname, client_port, backend_start, xact_start, query_start, state_change, wait_event_type, wait_event, state, backend_xid::varchar, backend_xmin::varchar, query",
-            " from pg_stat_activity order by backend_start, pid"))
+            " from pg_stat_activity where state != 'idle' order by backend_start, pid"))
         .with_context(|| anyhow!("preparing select pg_stat_activity"))?;
 
     Ok(Pg { client, stat })
