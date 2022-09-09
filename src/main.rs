@@ -12,7 +12,6 @@ use postgres::types::Oid;
 use postgres::{Client, Statement};
 use postgres_native_tls::MakeTlsConnector;
 use regex::Regex;
-use zstd::Encoder;
 
 lazy_static! {
     static ref WS: Regex = Regex::new("\\s+").expect("static regex");
@@ -99,7 +98,7 @@ fn render(lines: &[Vec<String>], mins: &mut [usize]) -> String {
     buf
 }
 
-fn open() -> Result<Encoder<'static, fs::File>> {
+fn open() -> Result<zstd::Encoder<'static, fs::File>> {
     let path = format!(
         "stat-activity-{}.zst",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -232,7 +231,7 @@ fn ts(ts: DateTime<Utc>) -> String {
 }
 
 fn tso(v: Option<DateTime<Utc>>) -> String {
-    v.map(|v| ts(v)).unwrap_or_default()
+    v.map(ts).unwrap_or_default()
 }
 
 fn auto<T: ToString>(v: &Option<T>) -> String {
