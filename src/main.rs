@@ -7,12 +7,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use lazy_static::lazy_static;
 use native_tls::TlsConnector;
 use postgres::{Client, Row, Statement};
 use postgres_native_tls::MakeTlsConnector;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 lazy_static! {
     static ref WS: Regex = Regex::new("\\s+").expect("static regex");
@@ -31,7 +32,7 @@ fn connect(config: &Config) -> Result<Pg> {
         .with_context(|| anyhow!("configuring tls connection"))?;
     let connector = MakeTlsConnector::new(connector);
 
-    let mut client = postgres::Client::connect(&config.conn_string, connector)
+    let mut client = Client::connect(&config.conn_string, connector)
         .with_context(|| anyhow!("connecting to database"))?;
 
     // millis
@@ -41,7 +42,7 @@ fn connect(config: &Config) -> Result<Pg> {
 
     let stat = client.prepare(
         concat!(
-            "select now(), datid, datname, pid, usesysid, usename, application_name, client_addr::varchar, client_hostname, client_port, backend_start, xact_start, query_start, state_change, wait_event_type, wait_event, state, backend_xid::varchar, backend_xmin::varchar, query",
+            "select now(), datid::int, datname, pid, usesysid::int, usename, application_name, client_addr::varchar, client_hostname, client_port, backend_start, xact_start, query_start, state_change, wait_event_type, wait_event, state, backend_xid::varchar, backend_xmin::varchar, query",
             " from pg_stat_activity where state != 'idle' order by backend_start, pid"))
         .with_context(|| anyhow!("preparing select pg_stat_activity"))?;
 
@@ -57,7 +58,7 @@ fn fetch(conn: &mut Pg) -> Result<Vec<Row>> {
 
 fn open() -> Result<zstd::Encoder<'static, fs::File>> {
     let path = format!(
-        "stat-activity-{}.zst",
+        "stat-activity-{}.jsonl.zst",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     );
     Ok(zstd::Encoder::new(fs::File::create(path)?, 9)?)
@@ -130,6 +131,59 @@ fn config() -> Result<Config> {
     })
 }
 
+#[derive(Serialize, Deserialize)]
+struct Line {
+    when: Option<DateTime<Utc>>,
+    records: Vec<Record>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Record {
+    datid: Option<i32>,
+    datname: Option<String>,
+    pid: Option<i32>,
+    usesysid: Option<i32>,
+    usename: Option<String>,
+    application_name: Option<String>,
+    client_addr: Option<String>,
+    client_hostname: Option<String>,
+    client_port: Option<i32>,
+    backend_start: Option<DateTime<Utc>>,
+    xact_start: Option<DateTime<Utc>>,
+    query_start: Option<DateTime<Utc>>,
+    state_change: Option<DateTime<Utc>>,
+    wait_event_type: Option<String>,
+    wait_event: Option<String>,
+    state: Option<String>,
+    backend_xid: Option<String>,
+    backend_xmin: Option<String>,
+    query: Option<String>,
+}
+
+fn record_from_row(row: &Row) -> Record {
+    Record {
+        datid: row.get(1),
+        datname: row.get(2),
+        pid: row.get(3),
+        usesysid: row.get(4),
+        usename: row.get(5),
+        application_name: row.get(6),
+        client_addr: row.get(7),
+        client_hostname: row.get(8),
+        client_port: row.get(9),
+        backend_start: row.get(10),
+        xact_start: row.get(11),
+        query_start: row.get(12),
+        state_change: row.get(13),
+        wait_event_type: row.get(14),
+        wait_event: row.get(15),
+        state: row.get(16),
+        backend_xid: row.get(17),
+        backend_xmin: row.get(18),
+        query: row.get(19),
+    }
+}
+
 fn main() -> Result<()> {
     let cfg = config()?;
 
@@ -137,8 +191,6 @@ fn main() -> Result<()> {
 
     let started_time = Instant::now();
     let mut output = open()?;
-
-    let mut mins: Box<[usize]> = vec![0usize; conn.stat.columns().len()].into_boxed_slice();
 
     let shutdown_requested = expect_ctrl_c()?;
 
@@ -153,13 +205,12 @@ fn main() -> Result<()> {
             }
         };
 
-        let lines = printer::convert_to_strings(conn.stat.columns(), rows);
+        let when = rows.get(0).map(|row| row.get::<_, DateTime<Utc>>(0));
+        let records = rows.iter().map(record_from_row).collect();
 
-        let buf = printer::render(&lines, &mut mins);
+        serde_json::to_writer(&mut output, &Line { when, records })?;
 
-        output
-            .write_all(buf.as_bytes())
-            .with_context(|| anyhow!("compressing / writing"))?;
+        output.write_all(b"\n")?;
         output
             .flush()
             .with_context(|| anyhow!("flushing compressed data"))?;
