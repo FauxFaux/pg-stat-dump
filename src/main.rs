@@ -1,3 +1,5 @@
+mod printer;
+
 use std::env::VarError;
 use std::fs;
 use std::io::Write;
@@ -5,11 +7,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{SecondsFormat, Utc};
 use lazy_static::lazy_static;
 use native_tls::TlsConnector;
-use postgres::types::Oid;
-use postgres::{Client, Statement};
+use postgres::{Client, Row, Statement};
 use postgres_native_tls::MakeTlsConnector;
 use regex::Regex;
 
@@ -47,55 +48,11 @@ fn connect(config: &Config) -> Result<Pg> {
     Ok(Pg { client, stat })
 }
 
-fn fetch(conn: &mut Pg) -> Result<Vec<Vec<String>>> {
-    let columns = conn.stat.columns();
-    let headers: Vec<_> = columns.iter().map(|c| c.name().to_string()).collect();
-
-    let mut lines = Vec::with_capacity(32);
-    lines.push(headers);
-
-    for row in conn
+fn fetch(conn: &mut Pg) -> Result<Vec<Row>> {
+    Ok(conn
         .client
         .query(&conn.stat, &[])
-        .with_context(|| anyhow!("executing prepared query"))?
-    {
-        let mut strings = Vec::with_capacity(columns.len());
-        for (i, column) in columns.iter().enumerate() {
-            strings.push(match column.type_().name() {
-                "timestamptz" => tso(row.get(i)),
-                "oid" => auto(&row.get::<_, Option<Oid>>(i)),
-                "name" | "text" | "varchar" => auto(&row.get::<_, Option<String>>(i)),
-                "int4" => auto(&row.get::<_, Option<i32>>(i)),
-                other => panic!("unknown type: {:?}", other),
-            });
-        }
-
-        lines.push(strings);
-    }
-
-    Ok(lines)
-}
-
-fn render(lines: &[Vec<String>], mins: &mut [usize]) -> String {
-    for line in lines {
-        for (col, min) in line.iter().zip(mins.iter_mut()) {
-            if col.len() > *min {
-                *min = col.len();
-            }
-        }
-    }
-
-    let mut buf = String::with_capacity(lines.len() * 300);
-    for line in lines {
-        let last = mins.len() - 1;
-        for (col, min) in line.iter().zip(mins.iter()).take(last) {
-            buf.push_str(&format!("{:1$}", col, min + 3));
-        }
-        buf.push_str(&line[last]);
-        buf.push('\n');
-    }
-
-    buf
+        .with_context(|| anyhow!("executing prepared query"))?)
 }
 
 fn open() -> Result<zstd::Encoder<'static, fs::File>> {
@@ -186,8 +143,8 @@ fn main() -> Result<()> {
     let shutdown_requested = expect_ctrl_c()?;
 
     loop {
-        let lines = match fetch(&mut conn) {
-            Ok(lines) => lines,
+        let rows = match fetch(&mut conn) {
+            Ok(rows) => rows,
             Err(e) => {
                 eprintln!("{:?} retrying error: {:?}", Utc::now(), e);
                 attempt_close(conn);
@@ -196,7 +153,9 @@ fn main() -> Result<()> {
             }
         };
 
-        let buf = render(&lines, &mut mins);
+        let lines = printer::convert_to_strings(conn.stat.columns(), rows);
+
+        let buf = printer::render(&lines, &mut mins);
 
         output
             .write_all(buf.as_bytes())
@@ -224,21 +183,6 @@ fn main() -> Result<()> {
     eprintln!("{:?} clean exit", Utc::now());
 
     Ok(())
-}
-
-fn ts(ts: DateTime<Utc>) -> String {
-    ts.to_rfc3339_opts(SecondsFormat::Micros, true)
-}
-
-fn tso(v: Option<DateTime<Utc>>) -> String {
-    v.map(ts).unwrap_or_default()
-}
-
-fn auto<T: ToString>(v: &Option<T>) -> String {
-    match v {
-        Some(v) => clean_ws(&v.to_string()),
-        None => String::new(),
-    }
 }
 
 fn clean_ws(s: &str) -> String {
