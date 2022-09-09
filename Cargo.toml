@@ -3,8 +3,6 @@ name = "pg-stat-dump"
 version = "0.1.0"
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 anyhow = "1"
 chrono = "0.4"
@@ -14,4 +12,4 @@ native-tls = "0.2"
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 postgres-native-tls = "0.5"
 regex = "1"
-zstd = "0.9"
+zstd = "0.11"
