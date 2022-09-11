@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use bunyarrs::{vars, vars_dbg, Bunyarr};
 use chrono::{DateTime, SecondsFormat, Utc};
 use lazy_static::lazy_static;
 use native_tls::TlsConnector;
@@ -14,6 +15,7 @@ use postgres::{Client, Row, Statement};
 use postgres_native_tls::MakeTlsConnector;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 lazy_static! {
     static ref WS: Regex = Regex::new("\\s+").expect("static regex");
@@ -56,33 +58,37 @@ fn fetch(conn: &mut Pg) -> Result<Vec<Row>> {
         .with_context(|| anyhow!("executing prepared query"))?)
 }
 
-fn open() -> Result<zstd::Encoder<'static, fs::File>> {
+fn open() -> Result<(String, zstd::Encoder<'static, fs::File>)> {
     let path = format!(
         "stat-activity-{}.jsonl.zst",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     );
-    Ok(zstd::Encoder::new(fs::File::create(path)?, 9)?)
+    let encoder = zstd::Encoder::new(fs::File::create(&path)?, 9)?;
+    Ok((path, encoder))
 }
 
-fn attempt_close(conn: Pg) {
+fn attempt_close(logger: &Bunyarr, conn: Pg) {
     if conn.client.is_closed() {
         return;
     }
 
     drop(conn.stat);
 
-    if let Err(e) = conn.client.close() {
-        eprintln!("{:?} error closing: {:?}", Utc::now(), e);
+    if let Err(err) = conn.client.close() {
+        logger.warn(vars_dbg! { err }, "error closing");
     }
 }
 
 fn expect_ctrl_c() -> Result<Receiver<()>> {
     let (initiate_shutdown, shutdown_requested) = std::sync::mpsc::sync_channel(1);
-    ctrlc::set_handler(move || match initiate_shutdown.try_send(()) {
-        Ok(()) => eprintln!("{:?} started clean shutdown", Utc::now()),
-        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-            eprintln!("{:?} second exit request; dying", Utc::now());
-            std::process::exit(6)
+    ctrlc::set_handler(move || {
+        let logger = Bunyarr::with_name("shutdown-handler");
+        match initiate_shutdown.try_send(()) {
+            Ok(()) => logger.info((), "started clean shutdown"),
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                logger.warn((), "second exit request, dying");
+                std::process::exit(6)
+            }
         }
     })?;
     Ok(shutdown_requested)
@@ -186,20 +192,23 @@ fn record_from_row(row: &Row) -> Record {
 
 fn main() -> Result<()> {
     let cfg = config()?;
+    let logger = Bunyarr::with_name("pg-stat-dump");
 
     let mut conn = connect(&cfg)?;
 
     let started_time = Instant::now();
-    let mut output = open()?;
+    let (path, mut output) = open()?;
 
     let shutdown_requested = expect_ctrl_c()?;
+
+    logger.info(vars! { path }, "ready to query");
 
     loop {
         let rows = match fetch(&mut conn) {
             Ok(rows) => rows,
-            Err(e) => {
-                eprintln!("{:?} retrying error: {:?}", Utc::now(), e);
-                attempt_close(conn);
+            Err(err) => {
+                logger.warn(vars_dbg! { err }, "retrying fetch on error");
+                attempt_close(&logger, conn);
                 conn = connect(&cfg).with_context(|| anyhow!("reconnecting after fetch error"))?;
                 fetch(&mut conn).with_context(|| anyhow!("fetch after reconnection"))?
             }
@@ -225,13 +234,13 @@ fn main() -> Result<()> {
         }
     }
 
-    attempt_close(conn);
+    attempt_close(&logger, conn);
 
     output
         .do_finish()
         .with_context(|| anyhow!("finalising output file during clean exit"))?;
 
-    eprintln!("{:?} clean exit", Utc::now());
+    logger.info((), "clean exit");
 
     Ok(())
 }
